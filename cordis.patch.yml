@@ -1,0 +1,7 @@
+# 本插件作为 profile 层贡献的 patch：把插件注册进配置树。
+#
+# Node 半：loader.import('dsh-file-extra') 解析到主入口 lib/index.js，
+
+- insert:
+    - id: dsh-file-extra
+      name: dsh-file-extra
