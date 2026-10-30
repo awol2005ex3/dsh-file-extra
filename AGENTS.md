@@ -12,9 +12,10 @@
 | `dsh-file-download` | 文件行下载按钮（HEAD 预检 + anchor 保存） | 并入本插件 |
 | `dsh-file-comment` | 预览选区评论并投递到会话输入框 | 并入本插件 |
 | — | 文件行删除按钮 | 本插件新增 |
+| — | 侧边栏 tab 右键菜单：关闭全部 / 关闭其他 | 本插件新增（官方席位 `sidebar.right.tab.menu.item`） |
 
 - **混合型插件**：宿主半 `src/index.ts` 负责 `fileUploads` 服务与两条写入路由；浏览器半 `src/client.ts` 负责全部 DOM 交互。
-- **浏览器半是纯 DOM 实现**：不 import cordis/dsh 包，不依赖 `ctx` 服务（connection 仅惰性尝试获取，用于评论投递的 legacy 兜底）。
+- **浏览器半是纯 DOM 实现**：不 import cordis/dsh 包，不依赖 `ctx` 服务（connection 仅惰性尝试获取，用于评论投递的 legacy 兜底）。**唯一例外**是 tab 菜单条目：惰性 `require('react')`（宿主 shell seed）+ `ctx.get('slots' / 'sidebarRight')` 注册官方席位，任一环节缺席静默退场。
 - **交付形态**：npm 包 + dsh bundle。`package.json` 的 `dsh.bundle` / `dsh.client` 字段声明，`cordis.patch.yml` 把插件注册进 Cordis profile 配置树。
 - dsh / cordis API 规范以技能文档 `.agents/skills/dsh-plugin-dev/SKILL.md` 为准，**禁止臆造 API**。
 
@@ -23,7 +24,7 @@
 | 文件 | 职责 |
 |------|------|
 | `src/index.ts` | 宿主端：注册 `FileUploads` 服务、上传路由、删除路由及路径校验 |
-| `src/client.ts` | 浏览器端全部逻辑：样式注入、文件树行/头按钮注入、上传/下载/删除、选区工具栏、评论对话框、Composer 投递 |
+| `src/client.ts` | 浏览器端全部逻辑：样式注入、文件树行/头按钮注入、上传/下载/删除、选区工具栏、评论对话框、Composer 投递、右栏 tab 菜单（关闭全部 / 关闭其他） |
 | `scripts/wrap-client.mjs` | 给 `lib/client.js` 套 `__ModuleLoader__` 闭包工厂外壳，并剥掉 tsc 追加的 `export {}` |
 | `cordis.patch.yml` | profile patch：把 `dsh-file-extra` 注册进配置树 |
 | `package.json` | 包声明 + dsh 插件配置；`files` 决定发包内容；`exports["./package.json"]` 必须保留 |
@@ -74,6 +75,13 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
 17. **宿主路由必须可逆**：两条路由都用 `ctx.effect(() => ctx.connection.fetch.register(...))` 注册，卸载时自动清理。`inject` 必须含 `connection` 与 `FileUploads` 依赖的 `agents` / `attachments` / `commands`。
 18. **旧插件必须卸载**：本插件使用独立 bundle id、单例守卫与路由；旧插件同时启用会造成文件行按钮重复。
 19. **发包内容**以 `package.json` `files` 为准（`lib`、`cordis.patch.yml`、`README.md`）；AGENTS.md 仅开发用、不发包。
+20. **tab 菜单槽位（`sidebar.right.tab.menu.item`）契约**：
+    - 它是 `kind: 'list'` 席位，**register 必须带 `id`**（list 按 id 去重，缺省会让别人的同 id 条目被顶掉；本插件用 `PLUGIN_ID`）。
+    - 注册写在 `slots.inject(key, () => slots.register(...))` 回调里——inject 只在席位被宿主声明后才调用，直接 register 会「向未声明席位注册」抛错。
+    - 条目组件拿到的 owner props 是**扁平展开**的 `{ tab, dismiss }`，外加会话标准包 `sessionId`；**动作执行前必须先 `dismiss()`**（菜单归 dockkit 所有，只在自身动作上关闭）。
+    - 关闭一律走 `sidebarRight.closeIn(sessionId, tabId)`（按会话精确、内部已做 `canCloseTab`：唯一引导页静默跳过 + 关闭清理 handler），会话清单读 `sidebarRight.openTabs.getSnapshot()` 过滤 `sessionId`；服务用 `ctx.get(...)` 惰性取，**不得**写进 `inject`（可选依赖缺席会挡住整个插件加载）。
+    - `require('react')` 由 wrap 工厂参数提供，`'react'` 是宿主 shell 的 seed 模块（`packages/client/web/src/seed.ts`）；取不到时功能整体静默退场，不要让它抛穿 init。
+    - 条目组件**任何异常都必须吞掉返回 null**：抛错会被错误边界放大，砸掉整个 tab 菜单。
 
 ## 5. 调试入口（DevTools Console）
 
@@ -85,6 +93,9 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
 | `upload refused: ...` / `delete refused: ...` | 上传 / 删除被服务端拒绝 |
 | `sent via ...` / `... failed:` | 评论投递命中的通道或失败原因 |
 | `change storm detected` | 观察器安全阀触发，行按钮不再自动补挂 |
+| `tab menu slot unavailable: ...` / `tab menu registration failed: ...` | slots 服务缺席或注册失败 → tab 菜单无追加条目（其余功能不受影响） |
+| `react unavailable: ...` | 宿主 seed 取不到 react → tab 菜单功能整体退场 |
+| `close tab failed: <id> ...` | 单个 tab 关闭异常（其余继续关） |
 | `window.__dshFileExtraMounted` | 单例守卫，true 表示已挂载（刷新复位） |
 | `window.__dshFileExtraError` | init 抛出的异常字符串 |
 | `window.__dshFileExtraConnection` | 惰性缓存的 connection 服务 |

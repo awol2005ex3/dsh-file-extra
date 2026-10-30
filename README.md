@@ -1,6 +1,6 @@
 # dsh-file-extra
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件：把 **文件上传 / 下载 / 删除** 与 **预览选区评论** 四类能力整合在同一个插件里。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件：把 **文件上传 / 下载 / 删除**、**预览选区评论** 与 **右栏 tab 批量关闭** 五类能力整合在同一个插件里。
 
 > 面向后续开发者与 AI Agent 的规范、踩坑与调试入口见 [AGENTS.md](./AGENTS.md)。
 
@@ -18,6 +18,14 @@
   - **评论并提问**：输入评论，与「文件路径 + 行列范围 + 代码块」一起格式化发送到会话输入框
   - **发送到聊天**：直接发送选中内容
 - 投递到输入框采用分层回退，命中顺序见 [AGENTS.md](./AGENTS.md) 的「Composer 投递链」。
+
+### 侧边栏 tab 菜单（右栏标签页）
+
+- 右键任意 tab 的上下文菜单，在宿主自带的「关闭」之后追加两项：
+  - **关闭其他**：关闭当前会话右栏里除这张 tab 外的全部 tab
+  - **关闭全部**：关闭当前会话右栏的全部 tab（剩最后一张时会连整列一起收起）
+- 实现走宿主官方席位 `sidebar.right.tab.menu.item`（list / session）注册 React 条目；动作先 `dismiss()`，再按 `sidebarRight.openTabs` 清单逐个 `sidebarRight.closeIn(sessionId, tabId)`，复用宿主的关闭清理与「唯一引导页不可关」规则。
+- 没有其它可关 tab 时对应条目不出现；菜单里只剩不可关的唯一引导页时整体不弹（与宿主行为一致）。
 
 ## 安装
 
@@ -60,7 +68,7 @@ dsh-file-extra/
 └── src/
     ├── index.ts          # 宿主端：fileUploads 服务 + 上传/删除两条精确路由
     └── client.ts         # 浏览器端全部逻辑：文件树按钮注入、上传/下载/删除、
-                          # 选区工具栏、评论对话框、Composer 投递
+                          # 选区工具栏、评论对话框、Composer 投递、右栏 tab 菜单
 ```
 
 ### 宿主半（Node）
@@ -81,7 +89,7 @@ dsh-file-extra/
 
 ### 浏览器半
 
-纯 DOM 实现，不 import cordis/dsh 包；只依赖公开 DOM 锚点与 HTTP 路由两个稳定面：
+纯 DOM 实现，不 import cordis/dsh 包；只依赖公开 DOM 锚点与 HTTP 路由两个稳定面。**唯一的 React 接触点**是 tab 菜单：惰性 `require('react')`（宿主 seed 模块）+ `ctx.get('slots' / 'sidebarRight')` 注册官方席位条目，任一环节缺席都静默退场（不影响其余功能）。
 
 | 能力 | 触发方式 | 实现要点 |
 |------|----------|----------|
@@ -89,6 +97,7 @@ dsh-file-extra/
 | 下载 | 行内注入按钮 | `HEAD` 预检（拒绝时 toast 原因）；预检通道不可达则直接 anchor 下载 |
 | 删除 | 行内注入按钮 | 确认框（默认聚焦“取消”）；成功后只刷新文件树，**不手动删 React 节点** |
 | 评论 | `selectionchange` | 选区必须落在预览区；格式化后分层投递给输入框 |
+| 关闭其他 / 关闭全部 | tab 右键菜单 | `slots.inject + register('sidebar.right.tab.menu.item')` 注入条目；`openTabs` 按会话算可见性，先 `dismiss()` 再逐个 `closeIn` |
 
 ## 关键 DOM 锚点
 
@@ -114,6 +123,9 @@ dsh-file-extra/
 | `download refused: <reason> <status> <path>` | 下载预检被拒 |
 | `upload refused: ...` / `delete refused: ...` | 上传 / 删除被服务端拒绝 |
 | `sent via ...` | 评论投递命中的通道 |
+| `tab menu slot unavailable: ...` / `tab menu registration failed: ...` | slots 服务缺席或注册失败 → tab 菜单无追加条目（其余功能不受影响） |
+| `react unavailable: ...` | 宿主 seed 取不到 react → tab 菜单功能整体退场 |
+| `close tab failed: <id> ...` | 单个 tab 关闭异常（其余继续关） |
 | `change storm detected` | MutationObserver 安全阀触发，观察器停用 |
 | `__dshFileExtraMounted` | 单例守卫；true 表示当前页已挂载（刷新复位） |
 | `__dshFileExtraConnection` | 缓存的 connection 服务（评论投递 legacy 层使用） |
@@ -125,6 +137,7 @@ dsh-file-extra/
 - 评论仅监听主文档的 `selectionchange`，预览内容位于 iframe 时不支持。
 - 文件树若被渲染进 Shadow DOM，行按钮注入不会生效（当前按主文档查询）。
 - 文案为中文硬编码，未接入 dsh locale 服务。
+- 「关闭全部 / 关闭其他」只作用于**当前会话**的右栏 tab，不跨会话、不关会话本身；清单来自 `sidebarRight.openTabs`，引导页作为唯一停靠 tab 时不可关（沿用宿主规则）。
 
 ## License
 

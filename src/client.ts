@@ -23,6 +23,8 @@
  *      bytes to /api/dsh-file-extra/upload for the tree root).
  *   4. Document preview: text selection toolbar → comment dialog → formatted
  *      text delivered to the conversation composer.
+ *   5. Sidebar tab actions menu: registers into the host's official
+ *      `sidebar.right.tab.menu.item` slot to add 关闭其他 / 关闭全部.
  */
 
 const PLUGIN_ID = 'dsh-file-extra'
@@ -32,6 +34,9 @@ const GUARD_KEY = '__dshFileExtraMounted'
 
 /* ── CJS globals injected by the wrap script ── */
 declare const module: { exports: unknown }
+/* 闭包工厂参数（wrap-client.mjs banner 提供）；此处仅是面声明，
+ * 运行时由模块系统解析——'react' 是宿主 shell 的 seed 模块。 */
+declare const require: (id: string) => any
 
 /* ── Narrow DOM access ── */
 const win = window as unknown as Record<string, unknown>
@@ -267,6 +272,14 @@ const STYLE_CSS = [
   ' color: #f38ba8; border-color: rgba(243, 139, 168, 0.6); background: rgba(243, 139, 168, 0.12); }',
   '.dsh-fe-up-btn { flex: none; margin-right: 4px; }',
   '@keyframes dsh-fe-pulse { 50% { opacity: 0.35; } }',
+  /* 侧边栏 tab 动作菜单条目：对齐 dockkit 自带菜单项的观感（.menuItem 的数值），
+   * 走全局 design token，主题切换自动跟随。 */
+  '.dsh-fe-menu-item {' +
+  ' padding: 4px 7px; color: var(--dsw-alias-label-primary, #cdd6f4);' +
+  ' font-size: 12px; text-align: left; background: transparent;' +
+  ' border: none; border-radius: var(--dsw-radius-md, 6px); cursor: pointer;' +
+  ' }',
+  '@media (hover: hover) { .dsh-fe-menu-item:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.16)); } }',
   '#' + TOAST_ID + ' {' +
   ' position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);' +
   ' padding: 7px 14px; border-radius: 8px; background: rgba(30, 30, 46, 0.95);' +
@@ -1359,6 +1372,166 @@ async function sendToComposer(info: SelectionInfo, comment: string): Promise<voi
 }
 
 /* ──────────────────────────────────────────────────────────
+ * Sidebar tabs — actions menu (close all / close others)
+ * ────────────────────────────────────────────────────────── */
+
+/**
+ * 宿主 tab 的右键动作菜单是官方扩展席位 `sidebar.right.tab.menu.item`
+ * （list / session）：dockkit 持有菜单本体并先渲染自带的「关闭」，注册方的
+ * 条目随后渲染。注册组件拿到 owner props `{ tab, dismiss }` 与会话标准包
+ * （含 `sessionId`）。菜单由 kit 所有且只在自身动作上关闭，所以**动作条目
+ * 必须先调用 dismiss**，否则会留下一个悬在被替换内容上的菜单。
+ */
+const TAB_MENU_SLOT = 'sidebar.right.tab.menu.item'
+const MENU_ITEM_CLASS = 'dsh-fe-menu-item'
+const CLOSE_OTHERS_LABEL = '关闭其他'
+const CLOSE_ALL_LABEL = '关闭全部'
+
+/** React：宿主 shell 的 seed 模块（'react'）。缺失时本功能整体退场，不报错。 */
+let reactFace: any
+let reactResolved = false
+
+function loadReact(): any {
+  if (reactResolved) return reactFace
+  reactResolved = true
+  try {
+    reactFace = require('react')
+  } catch (err) {
+    console.debug('[dsh-file-extra] react unavailable:', err)
+  }
+  return reactFace
+}
+
+/** `ctx.sidebarRight`：宿主的右栏导航面。用 ctx.get 惰性取，避开 cordis 4 严格 inject。 */
+function getSidebarRight(): any {
+  try {
+    return (pluginCtx?.get?.('sidebarRight') as any) ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 关一个 tab：优先 `closeIn(sessionId, tabId)`（精确到菜单所在会话，且复用
+ * 宿主的关闭清理与 sole-guide 规则——不可关时静默跳过），退回公开的 `close`。
+ */
+function closeSidebarTab(sidebar: any, sessionId: string, tabId: string): void {
+  if (typeof sidebar.closeIn === 'function') sidebar.closeIn(sessionId, tabId)
+  else if (typeof sidebar.close === 'function') sidebar.close(tabId)
+}
+
+/** `openTabs` 清单里的一条（sessionId / tabId / kind）。 */
+interface TabInventoryEntry {
+  sessionId?: unknown
+  tabId?: unknown
+  kind?: unknown
+}
+
+/** 注册组件的 owner props（宿主扁平展开）+ 会话标准包。 */
+interface TabMenuProps {
+  tab?: { id?: unknown; kind?: unknown } | null
+  dismiss?: unknown
+  sessionId?: unknown
+}
+
+/**
+ * 菜单条目组件：按当前清单算可见性并渲染「关闭其他」「关闭全部」。
+ * 全程 try/catch —— 抛错会砸掉整个菜单（错误边界），这里宁可不出条目。
+ */
+function renderTabMenuItems(props: TabMenuProps): unknown {
+  try {
+    const React = loadReact()
+    const sidebar = getSidebarRight()
+    if (!React?.createElement || !sidebar?.openTabs?.getSnapshot) return null
+
+    const targetId = typeof props.tab?.id === 'string' ? props.tab.id : null
+    if (targetId === null) return null
+    const dismiss: () => void = typeof props.dismiss === 'function'
+      ? (props.dismiss as () => void)
+      : () => {}
+    const sessionId = typeof props.sessionId === 'string'
+      ? props.sessionId
+      : sidebar.mounted?.getSnapshot?.()
+    if (typeof sessionId !== 'string') return null
+
+    const all = (sidebar.openTabs.getSnapshot() as TabInventoryEntry[])
+      .filter(entry => entry.sessionId === sessionId && typeof entry.tabId === 'string')
+    const others = all.filter(entry => entry.tabId !== targetId)
+    /* 与宿主 canCloseTab 同判据：唯一的引导页不可关——不可关时不出条目，
+     * 菜单（若也没有自带关闭项）自然整体不渲染。 */
+    const soleGuide = all.length === 1 && all[0]!.kind === 'guide'
+    const canCloseAll = all.length > 0 && !soleGuide
+    const canCloseOthers = others.length > 0
+    if (!canCloseAll && !canCloseOthers) return null
+
+    const act = (tabIds: string[]): void => {
+      dismiss()
+      for (const id of tabIds) {
+        try {
+          closeSidebarTab(sidebar, sessionId, id)
+        } catch (err) {
+          console.debug('[dsh-file-extra] close tab failed:', id, err)
+        }
+      }
+    }
+    /* 先关别的、最后关菜单锚定的这张：尽量让菜单随其宿主 chip 自然卸载 */
+    const allIds = [...new Set([...others.map(entry => entry.tabId as string), targetId])]
+
+    const h = React.createElement
+    const items: unknown[] = []
+    if (canCloseOthers) {
+      items.push(h('button', {
+        key: 'close-others', type: 'button', role: 'menuitem', className: MENU_ITEM_CLASS,
+        onClick: () => act(others.map(entry => entry.tabId as string)),
+      }, CLOSE_OTHERS_LABEL))
+    }
+    if (canCloseAll) {
+      items.push(h('button', {
+        key: 'close-all', type: 'button', role: 'menuitem', className: MENU_ITEM_CLASS,
+        onClick: () => act(allIds),
+      }, CLOSE_ALL_LABEL))
+    }
+    return items.length === 0 ? null : h(React.Fragment, null, items)
+  } catch (err) {
+    console.debug('[dsh-file-extra] tab menu items failed:', err)
+    return null
+  }
+}
+
+let tabMenuSlotInjected = false
+
+/**
+ * 被动注入 `sidebar.right.tab.menu.item` 并注册条目组件（幂等）。
+ * slots 服务可能晚于 apply 就绪——由 apply 与首次 contextmenu 各试一次。
+ * 注册在 slots.inject 的回调里：它只在席位已被声明后调用，避免
+ * 「向未声明席位 register 直接抛错」。
+ */
+function ensureTabMenuSlot(): void {
+  if (tabMenuSlotInjected || !pluginCtx) return
+  try {
+    const slots = pluginCtx.get?.('slots')
+    if (!slots || typeof slots.inject !== 'function') return
+    tabMenuSlotInjected = true
+    slots.inject(TAB_MENU_SLOT, () => {
+      try {
+        return slots.register({ name: TAB_MENU_SLOT, id: PLUGIN_ID }, renderTabMenuItems)
+      } catch (err) {
+        console.debug('[dsh-file-extra] tab menu registration failed:', err)
+        return () => {}
+      }
+    })
+  } catch (err) {
+    tabMenuSlotInjected = false
+    console.debug('[dsh-file-extra] tab menu slot unavailable:', err)
+  }
+}
+
+/** 菜单在 contextmenu 里打开：capture 相位先于 React，可在此补注册。 */
+function onDocumentContextMenu(): void {
+  ensureTabMenuSlot()
+}
+
+/* ──────────────────────────────────────────────────────────
  * Event wiring & init
  * ────────────────────────────────────────────────────────── */
 
@@ -1412,7 +1585,8 @@ function init(): void {
   observeTree()
   doc.addEventListener('selectionchange', onSelectionChange)
   doc.addEventListener('click', onGlobalClick)
-  console.log('[dsh-file-extra] plugin loaded: file actions + selection comments')
+  doc.addEventListener('contextmenu', onDocumentContextMenu, true)
+  console.log('[dsh-file-extra] plugin loaded: file actions + selection comments + tab menu')
 }
 
 /* ── Client plugin contract ── */
@@ -1433,6 +1607,7 @@ function apply(ctx: any): void {
   /* capture the official composer input actions (non-fatal; retried on send) */
   pluginCtx = ctx
   try { ensureComposerSlot() } catch { /* slots service may not be up yet */ }
+  try { ensureTabMenuSlot() } catch { /* ditto */ }
 
   try {
     init()
