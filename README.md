@@ -1,6 +1,6 @@
 # dsh-file-extra
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件：把 **文件上传 / 下载 / 删除**、**预览选区评论** 与 **右栏 tab 批量关闭** 五类能力整合在同一个插件里。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件：把 **文件上传 / 下载 / 删除**、**预览与终端选区评论** 与 **右栏 tab 批量关闭** 四类能力整合在同一个插件里。
 
 > 面向后续开发者与 AI Agent 的规范、踩坑与调试入口见 [AGENTS.md](./AGENTS.md)。
 
@@ -18,6 +18,14 @@
   - **评论并提问**：输入评论，与「文件路径 + 行列范围 + 代码块」一起格式化发送到会话输入框
   - **发送到聊天**：直接发送选中内容
 - 投递到输入框采用分层回退，命中顺序见 [AGENTS.md](./AGENTS.md) 的「Composer 投递链」。
+
+### 终端（右侧边栏 Terminal）
+
+- 在终端里拖选、双击选词或 Shift+方向键选中文字后，弹出**同一套**浮动工具栏：
+  - **评论并提问**：与「终端 tab 标题 + 终端输出」一起格式化发送到会话输入框
+  - **发送到聊天**：直接发送选中内容
+- 终端内容是 xterm.js 绘制的缓冲区，不是 DOM 文本（`user-select: none`），所以读取走 xterm 自己的 `copy` 事件管道（合成 `ClipboardEvent` + `DataTransfer`，不碰系统剪贴板），细节见 AGENTS.md 第 21 条。
+- 超过 20000 字符的选区会截断并附提示；由 shell 接管鼠标的程序（mouse reporting）下拖选会被程序消费，属终端自身行为。
 
 ### 侧边栏 tab 菜单（右栏标签页）
 
@@ -97,6 +105,7 @@ dsh-file-extra/
 | 下载 | 行内注入按钮 | `HEAD` 预检（拒绝时 toast 原因）；预检通道不可达则直接 anchor 下载 |
 | 删除 | 行内注入按钮 | 确认框（默认聚焦“取消”）；成功后只刷新文件树，**不手动删 React 节点** |
 | 评论 | `selectionchange` | 选区必须落在预览区；格式化后分层投递给输入框 |
+| 终端选区 | `mouseup` / `dblclick` / `keyup` | 合成 `copy` 事件读 xterm 选区；`activeTerminal` 记录归属，投递后清空 |
 | 关闭其他 / 关闭全部 | tab 右键菜单 | `slots.inject + register('sidebar.right.tab.menu.item')` 注入条目；`openTabs` 按会话算可见性，先 `dismiss()` 再逐个 `closeIn` |
 
 ## 关键 DOM 锚点
@@ -111,6 +120,9 @@ dsh-file-extra/
 | `[data-textpreview-url]` / `[data-textpreview-path]` | 文档预览根节点 / 头部路径标签 |
 | `pre code > .line` | 代码行（行号是 CSS counter，不在 DOM 里，行号 = 序数） |
 | `[data-sidebar-right-session]`、`[data-slot="sidebar.right.pane.tab"]` | 右侧边栏容器 / tab |
+| `section[data-sidebar-terminal]` | 右栏终端面板（`ui-sidebar-terminal` 的宿主元素） |
+| `div.xterm` | xterm.js 模拟器本体（终端选区与工具栏锚点） |
+| `[data-sidebar-right-tab]`（`span` / `div`） | tab 标题 chip / tab 内容体（共用 tab id） |
 
 以上选择器定义于 `src/client.ts` 顶部与评论区 `PREVIEW_SELECTORS`。
 
@@ -120,6 +132,7 @@ dsh-file-extra/
 |------|------|
 | `[dsh-file-extra] plugin loaded: ...` | init 成功；缺失 → 未加载或 init 抛错（查 `window.__dshFileExtraError`） |
 | `selection: {...}` | 预览内选区信息（长度 / 路径 / 起始行） |
+| `terminal selection: {len, tab}` | 终端选区命中（长度 / tab 标题） |
 | `download refused: <reason> <status> <path>` | 下载预检被拒 |
 | `upload refused: ...` / `delete refused: ...` | 上传 / 删除被服务端拒绝 |
 | `sent via ...` | 评论投递命中的通道 |
@@ -135,6 +148,7 @@ dsh-file-extra/
 - 删除只针对**文件**（含符号链接），目录不提供删除（避免误删整棵子树）。
 - 上传目标是**文件树根目录**，不支持上传到任意子目录。
 - 评论仅监听主文档的 `selectionchange`，预览内容位于 iframe 时不支持。
+- 终端选区依赖 xterm 的 `copy` 事件契约；`DataTransfer` / `ClipboardEvent` 缺失的环境下终端选区静默失效（预览评论不受影响）。
 - 文件树若被渲染进 Shadow DOM，行按钮注入不会生效（当前按主文档查询）。
 - 文案为中文硬编码，未接入 dsh locale 服务。
 - 「关闭全部 / 关闭其他」只作用于**当前会话**的右栏 tab，不跨会话、不关会话本身；清单来自 `sidebarRight.openTabs`，引导页作为唯一停靠 tab 时不可关（沿用宿主规则）。

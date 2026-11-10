@@ -13,6 +13,7 @@
 | `dsh-file-comment` | 预览选区评论并投递到会话输入框 | 并入本插件 |
 | — | 文件行删除按钮 | 本插件新增 |
 | — | 侧边栏 tab 右键菜单：关闭全部 / 关闭其他 | 本插件新增（官方席位 `sidebar.right.tab.menu.item`） |
+| — | 终端（xterm.js）选区引入对话框 | 本插件新增（与预览选区共用工具栏与投递链） |
 
 - **混合型插件**：宿主半 `src/index.ts` 负责 `fileUploads` 服务与两条写入路由；浏览器半 `src/client.ts` 负责全部 DOM 交互。
 - **浏览器半是纯 DOM 实现**：不 import cordis/dsh 包，不依赖 `ctx` 服务（connection 仅惰性尝试获取，用于评论投递的 legacy 兜底）。**唯一例外**是 tab 菜单条目：惰性 `require('react')`（宿主 shell seed）+ `ctx.get('slots' / 'sidebarRight')` 注册官方席位，任一环节缺席静默退场。
@@ -24,7 +25,7 @@
 | 文件 | 职责 |
 |------|------|
 | `src/index.ts` | 宿主端：注册 `FileUploads` 服务、上传路由、删除路由及路径校验 |
-| `src/client.ts` | 浏览器端全部逻辑：样式注入、文件树行/头按钮注入、上传/下载/删除、选区工具栏、评论对话框、Composer 投递、右栏 tab 菜单（关闭全部 / 关闭其他） |
+| `src/client.ts` | 浏览器端全部逻辑：样式注入、文件树行/头按钮注入、上传/下载/删除、选区工具栏（预览 + 终端）、评论对话框、Composer 投递、右栏 tab 菜单（关闭全部 / 关闭其他） |
 | `scripts/wrap-client.mjs` | 给 `lib/client.js` 套 `__ModuleLoader__` 闭包工厂外壳，并剥掉 tsc 追加的 `export {}` |
 | `cordis.patch.yml` | profile patch：把 `dsh-file-extra` 注册进配置树 |
 | `package.json` | 包声明 + dsh 插件配置；`files` 决定发包内容；`exports["./package.json"]` 必须保留 |
@@ -82,6 +83,11 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
     - 关闭一律走 `sidebarRight.closeIn(sessionId, tabId)`（按会话精确、内部已做 `canCloseTab`：唯一引导页静默跳过 + 关闭清理 handler），会话清单读 `sidebarRight.openTabs.getSnapshot()` 过滤 `sessionId`；服务用 `ctx.get(...)` 惰性取，**不得**写进 `inject`（可选依赖缺席会挡住整个插件加载）。
     - `require('react')` 由 wrap 工厂参数提供，`'react'` 是宿主 shell 的 seed 模块（`packages/client/web/src/seed.ts`）；取不到时功能整体静默退场，不要让它抛穿 init。
     - 条目组件**任何异常都必须吞掉返回 null**：抛错会被错误边界放大，砸掉整个 tab 菜单。
+21. **终端选区（xterm.js）读文本只能走 copy 事件**：侧边栏终端是 `@xterm/xterm` 模拟器，屏幕由内部缓冲区绘制、根元素 `.xterm` 自带 `user-select:none`，所以 `window.getSelection()` 永远读不到终端文字，`selectionchange` 也不会因终端拖选而触发。实现方式是对 `div.xterm` 派发一个合成的 `ClipboardEvent('copy')`，用 `DataTransfer` 接住 xterm 自己 `copy` 监听写入的 `selectionText`——不触碰系统剪贴板，也不依赖具体渲染器。
+    - 归属判定：`mousedown` 落在 `.xterm` 上才记录 `activeTerminal`；任何落在终端与工具栏之外的按下都会清空它（否则焦点移到输入框后会被旧选区重新拉起工具栏）。
+    - 刷新时机：`mouseup`（拖选）、`dblclick`（双击选词）、`keyup`（Shift+方向键）后各补一次读取；都延到下一帧/宏任务，等 xterm 自己的监听跑完。
+    - 终端面板锚点是 `section[data-sidebar-terminal]`（`ui-sidebar-terminal` 的宿主元素）；tab 标题取 `span[data-sidebar-right-tab]` 的文本，closest 找不到时再扫 shadow root（结果缓存）。
+    - 终端输出没有文件路径与行列号，投递时以「📟 `<tab 标题>` — 终端输出」作头部；超过 `MAX_TERMINAL_CHARS`（20000 字符）截断并标注。
 
 ## 5. 调试入口（DevTools Console）
 
@@ -89,6 +95,7 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
 |------|------|
 | `[dsh-file-extra] plugin loaded: ...` | init 成功。缺失 → bundle 未加载（安装问题），或 init 抛错（查 `window.__dshFileExtraError`） |
 | `selection: {...}` | 预览内选区信息；无输出 → 事件未触发（未加载 / iframe）或选区不在预览区 |
+| `terminal selection: {len, tab}` | 终端选区命中；`len` 为 0 或缺失 → xterm 无选区 / copy 事件未被接住（查 `ClipboardEvent` / `DataTransfer` 是否可用） |
 | `download refused: <reason> <status> <path>` | 下载预检被拒的原因与状态码 |
 | `upload refused: ...` / `delete refused: ...` | 上传 / 删除被服务端拒绝 |
 | `sent via ...` / `... failed:` | 评论投递命中的通道或失败原因 |
@@ -122,4 +129,5 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
 | 文案国际化 | 中文硬编码；见 §6 |
 | Shadow DOM 文件树 | 未验证。当前行扫描用 `document.querySelectorAll`；若实测文件树进入 shadow root，需改为递归遍历 shadowRoot 注入 |
 | 评论 iframe 预览 | 不支持（仅监听主文档 `selectionchange`） |
+| 终端选区 | 依赖 xterm 的 `copy` 事件契约（xterm 6.x 公开行为）。若 `DataTransfer` / `ClipboardEvent` 构造器缺失，终端选区静默失效；终端里**由 shell 自己处理鼠标**的模式（如全屏 TUI 开启 mouse reporting）下拖选会被程序吃掉，属终端行为，不另行处理 |
 | 行/列号检测 | 数预览内 `pre code > .line` 的序数（DSH 行号是 CSS counter），失败回退 `data-line`/class 启发式；识别不到只缺行号，不影响发送 |

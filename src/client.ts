@@ -23,7 +23,9 @@
  *      bytes to /api/dsh-file-extra/upload for the tree root).
  *   4. Document preview: text selection toolbar → comment dialog → formatted
  *      text delivered to the conversation composer.
- *   5. Sidebar tab actions menu: registers into the host's official
+ *   5. Sidebar terminal: the same selection toolbar over xterm.js selections
+ *      (its screen is a rendered buffer, not DOM text).
+ *   6. Sidebar tab actions menu: registers into the host's official
  *      `sidebar.right.tab.menu.item` slot to add 关闭其他 / 关闭全部.
  */
 
@@ -90,6 +92,10 @@ const DEL_LABEL = '删除此文件'
 const DEL_BUSY_LABEL = '正在删除…'
 const UP_LABEL = '上传文件'
 const UP_BUSY_LABEL = '正在上传…'
+
+/* 选区工具栏：预览与终端共用同一套按钮文案。 */
+const TIP_COMMENT_LABEL = '💬 评论并提问'
+const TIP_SEND_LABEL = '📤 发送到聊天'
 
 const DOWNLOAD_FAILURE: Record<string, string> = {
   notFound: '文件不存在或已被删除',
@@ -703,9 +709,21 @@ const PREVIEW_SELECTORS = [
   '[data-slot="sidebar.right.pane.tab"]',
 ].join(',')
 
+/** 右栏终端面板（ui-sidebar-terminal 的 `section[data-sidebar-terminal]`）；xterm 本体是其子节点 `.xterm`。 */
+const TERMINAL_PANEL_SELECTOR = '[data-sidebar-terminal]'
+
+/** 终端选区的投递上限：整屏 scrollback 全选可能极大，超出部分截断。 */
+const MAX_TERMINAL_CHARS = 20000
+
+/** 选区来源：预览文本走浏览器 Selection，终端走 xterm 自己的选区模型。 */
+type SelectionSource = 'preview' | 'terminal'
+
 interface SelectionInfo {
+  source: SelectionSource
   text: string
   filePath: string
+  /** 终端 tab 的可见标题（仅 terminal 来源）。 */
+  title: string
   startLine: number | null
   endLine: number | null
   startCol: number | null
@@ -716,6 +734,9 @@ interface SelectionInfo {
 let currentSelection: SelectionInfo | null = null
 let toolbarVisible = false
 let dialogVisible = false
+/** 最近一次在终端里按下鼠标的那个模拟器；拖选常在面板外松开，且 xterm 的
+ * 选区与焦点会连带触发文档 selectionchange，所以要留住这个引用判断归属。 */
+let activeTerminal: HTMLElement | null = null
 
 /* ── Composer slot capture (official conversation.input API) ── */
 
@@ -1055,8 +1076,10 @@ function updateSelection(): SelectionInfo | null {
 
   const lines = detectLines(sel)
   currentSelection = {
+    source: 'preview',
     text,
     filePath: getFilePath(sel.anchorNode),
+    title: '',
     startLine: lines?.start ?? null,
     endLine: lines?.end ?? null,
     startCol: lines?.startCol ?? null,
@@ -1065,11 +1088,112 @@ function updateSelection(): SelectionInfo | null {
   return currentSelection
 }
 
+/* ── Sidebar terminal — xterm.js selection ──
+ *
+ * The terminal is an xterm.js emulator: its screen is painted from an internal
+ * buffer and the root element declares `user-select: none`, so
+ * `window.getSelection()` never sees terminal text. The public surface that
+ * still carries the selection is xterm's own `copy` listener, which fills
+ * `ClipboardEvent.clipboardData` with `getSelection()`. Dispatching a synthetic
+ * copy event therefore reads the selection without touching the real
+ * clipboard, and works for whichever renderer is active.
+ */
+
+const DataTransferCtor = (win as unknown as { DataTransfer?: typeof DataTransfer }).DataTransfer
+const ClipboardEventCtor = (win as unknown as { ClipboardEvent?: typeof ClipboardEvent }).ClipboardEvent
+
+/** The `div.xterm` of a right-sidebar terminal panel; null outside one. */
+function xtermAt(node: Node | null): HTMLElement | null {
+  const host = closestAcrossShadow(node, '.xterm')
+  /* duck-typed instead of `instanceof HTMLElement`: browser constructors are not
+   * guaranteed to exist as free identifiers in the host's global scope (§ rule) */
+  if (host === null || typeof (host as Element).getBoundingClientRect !== 'function') return null
+  return closestAcrossShadow(host, TERMINAL_PANEL_SELECTOR) === null ? null : host as HTMLElement
+}
+
+/** Selected terminal text via xterm's copy pipeline; empty when nothing is selected. */
+function readTerminalSelection(xterm: HTMLElement): string {
+  if (!xterm.isConnected) return ''
+  if (typeof DataTransferCtor !== 'function' || typeof ClipboardEventCtor !== 'function') return ''
+  try {
+    const data = new DataTransferCtor()
+    /* non-bubbling: only xterm's own listener on this element should see it */
+    xterm.dispatchEvent(new ClipboardEventCtor('copy', { clipboardData: data, cancelable: true }))
+    return data.getData('text/plain')
+  } catch {
+    return ''
+  }
+}
+
+/** Visible tab title of the terminal panel containing `xterm` (empty when unknown). */
+function getTerminalTitle(xterm: HTMLElement): string {
+  try {
+    /* tab body and its chip share the same tab id (ui-sidebar-right shell) */
+    const body = closestAcrossShadow(xterm, 'div[data-sidebar-right-tab]')
+    const tabId = body?.getAttribute('data-sidebar-right-tab')
+    if (!tabId) return ''
+    const chip = findTabChip(tabId, xterm)
+    return chip?.textContent?.trim() ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** Resolved tab chips by tab id; the title is re-read on every selection change. */
+const tabChips = new Map<string, Element>()
+
+/**
+ * Locate the tab chip of `tabId`: the terminal's own tree root first (cheap),
+ * then the light DOM, then a shadow-root sweep as a last resort.
+ */
+function findTabChip(tabId: string, xterm: HTMLElement): Element | null {
+  const cached = tabChips.get(tabId)
+  if (cached !== undefined) {
+    if (cached.isConnected) return cached
+    tabChips.delete(tabId)
+  }
+  const safe = tabId.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  const selector = `span[data-sidebar-right-tab="${safe}"]`
+  const own = xterm.getRootNode()
+  const scopes: (ParentNode | null)[] = [own instanceof Document ? null : own as ParentNode, doc]
+  for (const scope of scopes) {
+    const found = scope?.querySelector(selector) ?? null
+    if (found !== null) { tabChips.set(tabId, found); return found }
+  }
+  /* DSH renders parts of the shell inside shadow roots; sweep them once and cache */
+  const all = doc.querySelectorAll('*')
+  for (let i = 0; i < all.length; i++) {
+    const root = all[i]!.shadowRoot
+    if (root === null) continue
+    const found = root.querySelector(selector)
+    if (found !== null) { tabChips.set(tabId, found); return found }
+  }
+  return null
+}
+
+/** Build the terminal selection info; null when the terminal has no selection. */
+function updateTerminalSelection(xterm: HTMLElement): SelectionInfo | null {
+  const raw = readTerminalSelection(xterm).replace(/\r\n/g, '\n').trim()
+  if (!raw) { currentSelection = null; return null }
+  const text = raw.length > MAX_TERMINAL_CHARS
+    ? raw.slice(0, MAX_TERMINAL_CHARS) + '\n…（终端输出超出 ' + MAX_TERMINAL_CHARS + ' 字符，已截断）'
+    : raw
+  currentSelection = {
+    source: 'terminal',
+    text,
+    filePath: '',
+    title: getTerminalTitle(xterm),
+    startLine: null,
+    endLine: null,
+    startCol: null,
+    endCol: null,
+  }
+  return currentSelection
+}
+
 /* ── Toolbar ── */
 
-function positionToolbar(toolbar: HTMLElement, sel: Selection): void {
-  if (!sel.rangeCount) return
-  const rect = sel.getRangeAt(0).getBoundingClientRect()
+function positionToolbar(toolbar: HTMLElement, rect: ToolbarRect): void {
   if (rect.width === 0 && rect.height === 0) return
 
   const vw = window.innerWidth
@@ -1086,7 +1210,39 @@ function positionToolbar(toolbar: HTMLElement, sel: Selection): void {
   toolbar.style.left = `${Math.round(left)}px`
 }
 
-function showToolbar(info: SelectionInfo): void {
+/** Anchor rectangle in viewport coordinates (plain object: bundle must not rely on DOMRect being a global). */
+interface ToolbarRect { top: number; left: number; width: number; height: number; bottom: number }
+
+/** Toolbar anchor rect: the browser selection range, or the terminal's visible screen. */
+function selectionRect(info: SelectionInfo, xterm: HTMLElement | null): ToolbarRect | null {
+  if (info.source === 'terminal' && xterm !== null) {
+    const rect = xterm.getBoundingClientRect()
+    /* Prefer the release point: a terminal selection spans rows with no
+     * per-cell DOM geometry, and anchoring at the cursor matches what the user
+     * just did (keyboard selections fall back to the pane's top edge). */
+    const pointer = lastPointer
+    if (pointer !== null
+      && pointer.x >= rect.left && pointer.x <= rect.right
+      && pointer.y >= rect.top && pointer.y <= rect.bottom) {
+      return { top: pointer.y, left: pointer.x, width: 1, height: 1, bottom: pointer.y + 1 }
+    }
+    return { top: rect.top + 52, left: rect.left, width: rect.width, height: rect.height - 52, bottom: rect.bottom }
+  }
+  const sel = doc.getSelection()
+  if (!sel || !sel.rangeCount) return null
+  return sel.getRangeAt(0).getBoundingClientRect()
+}
+
+/** Deliver a selection and end the selection interaction (toolbar + anchor). */
+function submitSelection(info: SelectionInfo, comment: string): void {
+  hideToolbar()
+  /* drop the terminal anchor: focusing the composer fires selectionchange and
+   * must not resurrect the toolbar from the terminal's still-live selection */
+  activeTerminal = null
+  void sendToComposer(info, comment)
+}
+
+function showToolbar(info: SelectionInfo, xterm: HTMLElement | null = null): void {
   let toolbar = doc.getElementById(TOOLBAR_ID)
 
   if (!toolbar) {
@@ -1098,11 +1254,11 @@ function showToolbar(info: SelectionInfo): void {
     })
     snippet.textContent = info.text.length > 36 ? info.text.slice(0, 36) + '...' : info.text
 
-    const commentBtn = el('button', { style: BTN_CSS + BTN_PRI_CSS, textContent: '\u{1F4AC} \u8BC4\u8BBA\u5E76\u63D0\u95EE' })
-    const sendBtn = el('button', { style: BTN_CSS, textContent: '\u{1F4E4} \u53D1\u9001\u5230\u804A\u5929' })
+    const commentBtn = el('button', { style: BTN_CSS + BTN_PRI_CSS, textContent: TIP_COMMENT_LABEL })
+    const sendBtn = el('button', { style: BTN_CSS, textContent: TIP_SEND_LABEL })
 
     commentBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); showDialog(info) })
-    sendBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); void sendToComposer(info, '') })
+    sendBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); submitSelection(info, '') })
 
     toolbar.append(snippet, commentBtn, sendBtn)
     doc.body.append(toolbar)
@@ -1114,16 +1270,16 @@ function showToolbar(info: SelectionInfo): void {
     }
     /* rebind click handlers with fresh selection info */
     const btns = toolbar.querySelectorAll('button')
-    const newComment = el('button', { style: BTN_CSS + BTN_PRI_CSS, textContent: '\u{1F4AC} \u8BC4\u8BBA\u5E76\u63D0\u95EE' })
-    const newSend = el('button', { style: BTN_CSS, textContent: '\u{1F4E4} \u53D1\u9001\u5230\u804A\u5929' })
+    const newComment = el('button', { style: BTN_CSS + BTN_PRI_CSS, textContent: TIP_COMMENT_LABEL })
+    const newSend = el('button', { style: BTN_CSS, textContent: TIP_SEND_LABEL })
     newComment.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); showDialog(info) })
-    newSend.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); void sendToComposer(info, '') })
+    newSend.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); submitSelection(info, '') })
     if (btns[0]) btns[0].replaceWith(newComment)
     if (btns[1]) btns[1].replaceWith(newSend)
   }
 
-  const sel = doc.getSelection()
-  if (sel) positionToolbar(toolbar, sel)
+  const rect = selectionRect(info, xterm)
+  if (rect !== null) positionToolbar(toolbar, rect)
   toolbar.style.display = 'flex'
   toolbarVisible = true
 }
@@ -1140,6 +1296,9 @@ function showDialog(info: SelectionInfo): void {
   hideToolbar()
   hideDialog()
   dialogVisible = true
+  /* the dialog owns the selection now; a terminal selection must not re-show
+   * the toolbar on the selectionchange that this click triggers */
+  activeTerminal = null
 
   const overlay = el('div', { id: DIALOG_ID, style: DIALOG_OV_CSS })
 
@@ -1153,11 +1312,15 @@ function showDialog(info: SelectionInfo): void {
 
   /* body */
   const metaParts: string[] = []
-  if (info.filePath) metaParts.push('\u{1F4C4} ' + info.filePath)
+  if (info.source === 'terminal') {
+    metaParts.push('\u{1F4DF} ' + (info.title || '终端'))
+  } else if (info.filePath) {
+    metaParts.push('\u{1F4C4} ' + info.filePath)
+  }
   const rangeLabel = lineRangeLabel(info)
   if (rangeLabel) metaParts.push(rangeLabel)
   const meta = el('div', { style: META_CSS })
-  meta.textContent = metaParts.join('  |  ') || '(\u672A\u77E5\u6587\u4EF6)'
+  meta.textContent = metaParts.join('  |  ') || '\u672A\u77E5\u5185\u5BB9\u6765\u6E90'
 
   const codePre = el('pre', { style: CODE_PRE_CSS })
   codePre.textContent = info.text.length > 500 ? info.text.slice(0, 500) + '\n...' : info.text
@@ -1177,13 +1340,13 @@ function showDialog(info: SelectionInfo): void {
   sendCommentBtn.addEventListener('click', () => {
     const comment = textarea.value.trim()
     if (!comment) { textarea.style.borderColor = '#f38ba8'; textarea.focus(); return }
-    void sendToComposer(info, comment)
+    submitSelection(info, comment)
     hideDialog()
   })
 
   const sendOnlyBtn = el('button', { style: BTN_CSS, textContent: '\u{1F4E4} \u53EA\u53D1\u4EE3\u7801' })
   sendOnlyBtn.addEventListener('click', () => {
-    void sendToComposer(info, '')
+    submitSelection(info, '')
     hideDialog()
   })
 
@@ -1235,6 +1398,18 @@ function lineRangeLabel(info: SelectionInfo): string {
 function formatMessage(info: SelectionInfo, comment: string): string {
   const parts: string[] = []
 
+  if (info.source === 'terminal') {
+    /* terminal output: label the tab instead of a file path (there is none) */
+    const label = info.title || '终端'
+    parts.push('\u{1F4DF} `' + label + '` — 终端输出')
+    parts.push('```')
+    parts.push(info.text)
+    parts.push('```')
+    if (comment) parts.push('\u{1F4AC} ' + comment)
+    parts.push('')
+    return parts.join('\n')
+  }
+
   /* header: file + lines */
   let header = ''
   if (info.filePath) header += '\u{1F4C4} `' + info.filePath + '`'
@@ -1285,13 +1460,15 @@ function pasteIntoComposer(text: string): boolean {
   if (!target) return false
   target.focus()
   /* synthetic paste event: Lexical's DOM paste listener reads clipboardData */
-  try {
-    const data = new DataTransfer()
-    data.setData('text/plain', text)
-    const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true })
-    /* dispatchEvent === false → preventDefault → a handler consumed the paste */
-    if (!target.dispatchEvent(event)) return true
-  } catch { /* DataTransfer / ClipboardEvent may be unavailable */ }
+  if (typeof DataTransferCtor === 'function' && typeof ClipboardEventCtor === 'function') {
+    try {
+      const data = new DataTransferCtor()
+      data.setData('text/plain', text)
+      const event = new ClipboardEventCtor('paste', { clipboardData: data, bubbles: true, cancelable: true })
+      /* dispatchEvent === false → preventDefault → a handler consumed the paste */
+      if (!target.dispatchEvent(event)) return true
+    } catch { /* the editor may reject synthetic clipboard events */ }
+  }
   /* fallback: execCommand keeps the editor's undo integration */
   try {
     return doc.execCommand('insertText', false, text)
@@ -1538,33 +1715,150 @@ function onDocumentContextMenu(): void {
 function onSelectionChange(): void {
   if (dialogVisible) return
 
-  const sel = doc.getSelection()
-  if (!sel) return
+  /* The last mousedown decides which surface owns the interaction. A terminal
+   * drag does not necessarily clear the DOM selection (xterm preventDefaults
+   * mousedown), so a lingering preview selection must not shadow it — and
+   * conversely a press inside the terminal disables preview lookups. */
+  const terminal = activeTerminal
+  if (terminal !== null && !terminal.isConnected) activeTerminal = null
+  if (activeTerminal !== null) {
+    const live = activeTerminal
+    const terminalInfo = updateTerminalSelection(live)
+    if (terminalInfo !== null) {
+      console.debug('[dsh-file-extra] terminal selection:', {
+        len: terminalInfo.text.length,
+        tab: terminalInfo.title,
+      })
+      showToolbar(terminalInfo, live)
+      return
+    }
+    if (toolbarVisible) hideToolbar()
+    return
+  }
 
+  /* document preview text: the DOM selection is the authoritative signal */
   const info = updateSelection()
-  if (info) {
+  if (info !== null) {
     console.debug('[dsh-file-extra] selection:', {
       len: info.text.length,
       path: info.filePath,
       lines: info.startLine,
     })
     showToolbar(info)
-  } else if (toolbarVisible) {
-    hideToolbar()
+    return
   }
+
+  if (toolbarVisible) hideToolbar()
+}
+
+/**
+ * Record which terminal (if any) a mouse press started in.
+ *
+ * xterm selects by dragging from inside `.xterm` and finishes on `mouseup`
+ * anywhere on the document, so the release target is unreliable; the press
+ * target is the anchor that tells us a terminal drag just happened. Terminal
+ * selections never trigger `selectionchange` (no DOM selection exists), so the
+ * toolbar is refreshed straight from the mouseup.
+ */
+function onPointerDown(e: Event): void {
+  const target = eventTarget(e)
+  if (target === null) { activeTerminal = null; return }
+  /* pressing our own toolbar must not drop the terminal anchor: the click that
+   * follows is what sends the selection */
+  const toolbar = doc.getElementById(TOOLBAR_ID)
+  if (toolbar !== null && toolbar.contains(target)) return
+  /* any other press ends terminal-selection mode, so a later click in the
+   * composer cannot resurrect a stale terminal selection */
+  activeTerminal = xtermAt(target)
+}
+
+/**
+ * Innermost target of an event. `event.target` is retargeted to the shadow host
+ * when the listener sits above a shadow root, and DSH renders the sidebar inside
+ * Shadow DOM — `composedPath()` yields the real inner node.
+ */
+function eventTarget(e: Event): Node | null {
+  const path = typeof e.composedPath === 'function' ? e.composedPath() : []
+  const first: unknown = path.length > 0 ? path[0] : e.target
+  if (first === null || typeof first !== 'object') return null
+  /* duck-typed: `Node` may not exist as a free identifier in the host scope */
+  return typeof (first as Node).nodeType === 'number' ? first as Node : null
+}
+
+/** Last mouse release position (viewport coords) — anchors the terminal toolbar. */
+let lastPointer: { x: number; y: number } | null = null
+
+/**
+ * Re-read the terminal selection and show/hide the toolbar accordingly.
+ * Shared by mouseup (drag selects) and keyup (Shift+navigation selects), the
+ * two public-DOM moments after which xterm's selection model has settled.
+ */
+function refreshFromTerminal(terminal: HTMLElement): void {
+  if (dialogVisible || !terminal.isConnected || activeTerminal !== terminal) return
+  const info = updateTerminalSelection(terminal)
+  if (info !== null) showToolbar(info, terminal)
+  else if (toolbarVisible) hideToolbar()
+}
+
+function onPointerUp(e: Event): void {
+  if (typeof (e as MouseEvent).clientX === 'number') {
+    const pointer = e as MouseEvent
+    lastPointer = { x: pointer.clientX, y: pointer.clientY }
+  }
+  const terminal = activeTerminal
+  if (terminal === null || !terminal.isConnected) return
+  const rect = terminal.getBoundingClientRect()
+  /* a collapsed/hidden pane can still be connected; ignore it */
+  if (rect.width === 0 || rect.height === 0) return
+  /* xterm updates its selection model on mouseup (its own document listener),
+   * so read it on the next frame, after that listener has run */
+  nextFrame(() => refreshFromTerminal(terminal))
+}
+
+/**
+ * Double/triple click select a word/line asynchronously after the second
+ * mouseup, so the frame scheduled there can still see the old selection;
+ * re-read after the browser finishes the click sequence.
+ */
+function onTerminalMultiClick(): void {
+  const terminal = activeTerminal
+  if (terminal === null || !terminal.isConnected) return
+  timers.setTimeout(() => refreshFromTerminal(terminal), 0)
+}
+
+/**
+ * Keys that can move or clear xterm's selection (Shift+navigation selecting,
+ * Escape clearing). Plain typing is skipped so the synthetic copy read does not
+ * run on every keystroke.
+ */
+function changesTerminalSelection(e: KeyboardEvent): boolean {
+  if (e.shiftKey) return true
+  switch (e.key) {
+    case 'ArrowLeft': case 'ArrowRight': case 'ArrowUp': case 'ArrowDown':
+    case 'Home': case 'End': case 'PageUp': case 'PageDown': case 'Escape':
+      return true
+    default:
+      return false
+  }
+}
+
+function onKeyUp(e: KeyboardEvent): void {
+  const terminal = activeTerminal
+  if (terminal === null || !terminal.isConnected || !changesTerminalSelection(e)) return
+  nextFrame(() => refreshFromTerminal(terminal))
 }
 
 function onGlobalClick(e: Event): void {
   if (dialogVisible) return
   if (!toolbarVisible) return
-  const target = e.target as HTMLElement | null
-  if (!target) return
+  const target = eventTarget(e)
+  if (target === null) return
 
   const toolbar = doc.getElementById(TOOLBAR_ID)
   if (toolbar?.contains(target)) return
 
-  /* click outside preview area → dismiss toolbar */
-  if (!inPreviewArea(target)) hideToolbar()
+  /* click outside the preview / terminal area → dismiss toolbar */
+  if (!inPreviewArea(target) && xtermAt(target) === null) hideToolbar()
 }
 
 /** Resolve the connection lazily (not in inject — it must not block loading). */
@@ -1584,9 +1878,13 @@ function init(): void {
   decorateRows()
   observeTree()
   doc.addEventListener('selectionchange', onSelectionChange)
+  doc.addEventListener('mousedown', onPointerDown, true)
+  doc.addEventListener('mouseup', onPointerUp, true)
+  doc.addEventListener('dblclick', onTerminalMultiClick, true)
+  doc.addEventListener('keyup', onKeyUp, true)
   doc.addEventListener('click', onGlobalClick)
   doc.addEventListener('contextmenu', onDocumentContextMenu, true)
-  console.log('[dsh-file-extra] plugin loaded: file actions + selection comments + tab menu')
+  console.log('[dsh-file-extra] plugin loaded: file actions + selection comments + terminal selection + tab menu')
 }
 
 /* ── Client plugin contract ── */
