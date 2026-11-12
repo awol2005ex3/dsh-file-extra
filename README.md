@@ -1,6 +1,6 @@
 # dsh-file-extra
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件：把 **文件上传 / 下载 / 删除**、**预览与终端选区评论** 与 **右栏 tab 批量关闭** 四类能力整合在同一个插件里。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）插件：把 **文件上传 / 下载 / 删除**、**预览与终端选区评论**、**右栏 tab 批量关闭** 与 **文件右键 @引用** 整合在同一个插件里。
 
 > 面向后续开发者与 AI Agent 的规范、踩坑与调试入口见 [AGENTS.md](./AGENTS.md)。
 
@@ -11,6 +11,7 @@
 - **上传**：文件树头部刷新按钮左侧新增上传按钮，点击选择（支持多选）后上传到当前文件树根目录，逐个串行上传并汇总结果。
 - **下载**：每个文件行 hover 时显示下载按钮；先对 `/api/file` 做 `HEAD` 预检，通过后交给浏览器下载管理器保存。
 - **删除**：每个文件行 hover 时显示删除按钮；确认框确认后调用插件自己的删除路由，成功后刷新文件树。
+- **@引用**：文件行右键菜单追加「添加到对话 @文件」，直接把文件引用标签插入**所属会话**的输入框，不自动发送消息、不写剪贴板。优先走官方 chip 插入；事件未接受时尝试该会话的 `insertText` 插入 `@路径` 文本。输入框未就绪或不可编辑时明确提示失败。路径含空格自动加引号 `@"…"`，控制字符 / 引号路径不显示该条目。
 
 ### 文档预览（右侧边栏预览）
 
@@ -76,7 +77,7 @@ dsh-file-extra/
 └── src/
     ├── index.ts          # 宿主端：fileUploads 服务 + 上传/删除两条精确路由
     └── client.ts         # 浏览器端全部逻辑：文件树按钮注入、上传/下载/删除、
-                          # 选区工具栏、评论对话框、Composer 投递、右栏 tab 菜单
+                          # 选区工具栏、评论对话框、Composer 投递、右栏 tab 菜单、文件 @引用菜单
 ```
 
 ### 宿主半（Node）
@@ -97,7 +98,7 @@ dsh-file-extra/
 
 ### 浏览器半
 
-纯 DOM 实现，不 import cordis/dsh 包；只依赖公开 DOM 锚点与 HTTP 路由两个稳定面。**唯一的 React 接触点**是 tab 菜单：惰性 `require('react')`（宿主 seed 模块）+ `ctx.get('slots' / 'sidebarRight')` 注册官方席位条目，任一环节缺席都静默退场（不影响其余功能）。
+以 DOM 交互为主，不 import cordis/dsh 包；宿主服务经 `ctx.get(...)` 惰性获取。React 仅用于官方槽位：tab 菜单组件和不渲染内容的输入框捕获组件，均通过惰性 `require('react')` 获取宿主 seed 模块。输入框捕获使用列表槽位，不影响语音等独占槽位插件；服务缺席只影响对应能力。
 
 | 能力 | 触发方式 | 实现要点 |
 |------|----------|----------|
@@ -107,6 +108,7 @@ dsh-file-extra/
 | 评论 | `selectionchange` | 选区必须落在预览区；格式化后分层投递给输入框 |
 | 终端选区 | `mouseup` / `dblclick` / `keyup` | 合成 `copy` 事件读 xterm 选区；`activeTerminal` 记录归属，投递后清空 |
 | 关闭其他 / 关闭全部 | tab 右键菜单 | `slots.inject + register('sidebar.right.tab.menu.item')` 注入条目；`openTabs` 按会话算可见性，先 `dismiss()` 再逐个 `closeIn` |
+| 添加到对话 @文件 | 文件行右键菜单 | `contextMenus.register(target:'file')` 追加动作；`conversation.input.left` 列表槽位按会话捕获 InputActions，`sessions.scope(sessionId)` 派发 `slash/input-insert-reference` 插 chip，备选 `insertText`；不写剪贴板 |
 
 ## 关键 DOM 锚点
 
@@ -139,6 +141,10 @@ dsh-file-extra/
 | `tab menu slot unavailable: ...` / `tab menu registration failed: ...` | slots 服务缺席或注册失败 → tab 菜单无追加条目（其余功能不受影响） |
 | `react unavailable: ...` | 宿主 seed 取不到 react → tab 菜单功能整体退场 |
 | `close tab failed: <id> ...` | 单个 tab 关闭异常（其余继续关） |
+| `file menu unavailable: ...` | 文件右键菜单注册异常（服务缺席时静默跳过） |
+| `composer capture unavailable: ...` / `composer not captured: <sessionId>` | 输入框槽位注册失败 / 目标会话输入框未挂载 |
+| `reference via ...` | @引用直接插入命中的通道（scoped insert-reference / insertText） |
+| `insert-reference failed: ...` | 插入异常，提示用户重试，不写剪贴板 |
 | `change storm detected` | MutationObserver 安全阀触发，观察器停用 |
 | `__dshFileExtraMounted` | 单例守卫；true 表示当前页已挂载（刷新复位） |
 | `__dshFileExtraConnection` | 缓存的 connection 服务（评论投递 legacy 层使用） |
@@ -152,6 +158,7 @@ dsh-file-extra/
 - 文件树若被渲染进 Shadow DOM，行按钮注入不会生效（当前按主文档查询）。
 - 文案为中文硬编码，未接入 dsh locale 服务。
 - 「关闭全部 / 关闭其他」只作用于**当前会话**的右栏 tab，不跨会话、不关会话本身；清单来自 `sidebarRight.openTabs`，引导页作为唯一停靠 tab 时不可关（沿用宿主规则）。
+- 「添加到对话 @文件」需要宿主 `contextMenus` 提供菜单；引用标签插入还需要 `sessions` 作用域与已挂载的目标会话输入框。插件通过 `conversation.input.left` 列表槽位捕获 InputActions，不竞争语音输入的独占槽位；卸载时清理引用，避免投递到旧输入框。输入框未就绪或锁定时提示重试，不向其他会话粘贴、不退回剪贴板。
 
 ## License
 

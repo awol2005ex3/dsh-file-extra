@@ -27,6 +27,9 @@
  *      (its screen is a rendered buffer, not DOM text).
  *   6. Sidebar tab actions menu: registers into the host's official
  *      `sidebar.right.tab.menu.item` slot to add 关闭其他 / 关闭全部.
+ *   7. File-tree row context menu: registers a `contextMenus` data action
+ *      (target 'file') that inserts the file as an @file reference chip into
+ *      its session's composer via the scoped insert-reference event.
  */
 
 const PLUGIN_ID = 'dsh-file-extra'
@@ -749,33 +752,49 @@ interface ComposerInputActions {
 let pluginCtx: any = null
 let capturedInputActions: ComposerInputActions | null = null
 let composerSlotInjected = false
+const inputActionsBySession = new Map<string, ComposerInputActions>()
+const COMPOSER_CAPTURE_SLOT = 'conversation.input.left'
 
-/**
- * Passively occupy `conversation.input.activity` (kind: single, scope: session)
- * to capture the active composer's InputActions — the official plugin channel
- * (see dsh fixture apps/web/tests/fixtures/plugins/fixture-input-extension).
- * The render body only stores props.inputActions and renders nothing.
- * Idempotent; called again on the first send in case the `slots` service was
- * not yet available when apply() ran (boot ordering).
- */
+function renderComposerCapture(props: { sessionId?: string; inputActions?: ComposerInputActions }): null {
+  const React = loadReact()
+  if (!React) return null
+  React.useLayoutEffect(() => {
+    const { sessionId, inputActions } = props
+    if (!sessionId || !inputActions) return
+    inputActionsBySession.set(sessionId, inputActions)
+    capturedInputActions = inputActions
+    return () => {
+      if (inputActionsBySession.get(sessionId) === inputActions) inputActionsBySession.delete(sessionId)
+      if (capturedInputActions === inputActions) {
+        capturedInputActions = [...inputActionsBySession.values()].pop() ?? null
+      }
+    }
+  }, [props.sessionId, props.inputActions])
+  return null
+}
+
+// A single slot can be occupied by voice input; a list entry captures without competing with it.
 function ensureComposerSlot(): void {
   if (composerSlotInjected || !pluginCtx) return
   try {
-    /* ctx.get bypasses cordis 4's strict inject check on property access */
     const slots = pluginCtx.get?.('slots')
     if (!slots || typeof slots.inject !== 'function') return
     composerSlotInjected = true
-    slots.inject('conversation.input.activity', () => slots.register(
-      { name: 'conversation.input.activity' },
-      (props: any) => {
-        if (props && props.inputActions) capturedInputActions = props.inputActions as ComposerInputActions
-        /* render nothing; the slot machinery's error boundary tolerates null */
-        return null
-      },
-    ))
-  } catch {
-    /* leave the flag false so the next send retries */
+    slots.inject(COMPOSER_CAPTURE_SLOT, () => {
+      try {
+        return slots.register(
+          { name: COMPOSER_CAPTURE_SLOT, id: PLUGIN_ID + '/composer-capture' },
+          renderComposerCapture,
+        )
+      } catch (err) {
+        composerSlotInjected = false
+        console.debug('[dsh-file-extra] composer capture unavailable:', err)
+        return () => {}
+      }
+    })
+  } catch (err) {
     composerSlotInjected = false
+    console.debug('[dsh-file-extra] composer capture unavailable:', err)
   }
 }
 
@@ -1481,8 +1500,7 @@ function pasteIntoComposer(text: string): boolean {
 async function sendToComposer(info: SelectionInfo, comment: string): Promise<void> {
   const text = formatMessage(info, comment)
 
-  /* 1. Official channel: InputActions captured from the composer activity slot
-   *    (revision-guarded, undo-integrated, newlines split paragraphs). */
+  /* 1. Official channel: revision-guarded InputActions captured from the composer list slot. */
   try {
     ensureComposerSlot()
     const actions = capturedInputActions
@@ -1705,7 +1723,104 @@ function ensureTabMenuSlot(): void {
 
 /** 菜单在 contextmenu 里打开：capture 相位先于 React，可在此补注册。 */
 function onDocumentContextMenu(): void {
+  ensureComposerSlot()
   ensureTabMenuSlot()
+  ensureFileMenu()
+}
+
+/* ──────────────────────────────────────────────────────────
+ * File tree — context menu: add to conversation (@file)
+ * ────────────────────────────────────────────────────────── */
+
+const FILE_MENU_ORDER = 300
+const ADD_REF_LABEL = '添加到对话 @文件'
+const ADD_REF_ACTION_ID = PLUGIN_ID + '/add-reference'
+
+interface FileMenuTarget { sessionId?: unknown; path?: unknown }
+
+/** 本地复刻 @deepseek-ai/dsh-file-reference/grammar formatFileMention 的 file 分支。 */
+function formatFileMentionText(path: string): string | undefined {
+  if (/[\x00-\x1f\x7f-\x9f"]/u.test(path)) return undefined
+  return /\s/u.test(path) ? '@"' + path + '"' : '@' + path
+}
+
+/** 本地复刻 util/workspace-path relativizeToCwd：只剥根前缀，保留原分隔符。 */
+function relativizeToCwd(text: string, cwd: string | undefined): string {
+  if (cwd === undefined || cwd === '') return text
+  const root = cwd.replace(/[/\\]+$/, '')
+  if (text.startsWith(root + '/') || text.startsWith(root + '\\')) return text.slice(root.length + 1)
+  return text
+}
+
+function sessionCwd(sessionId: string): string | undefined {
+  try {
+    const cwd = pluginCtx?.get?.('sessions')?.list?.getSnapshot?.()?.byId?.[sessionId]?.cwd
+    return typeof cwd === 'string' ? cwd : undefined
+  } catch { return undefined }
+}
+
+function addFileReference(sessionId: string, path: string): void {
+  const relative = relativizeToCwd(path, sessionCwd(sessionId))
+  const mention = formatFileMentionText(relative)
+  if (mention === undefined) { showToast('该路径无法表示为 @引用'); return }
+  const actions = inputActionsBySession.get(sessionId)
+  if (!actions) {
+    console.debug('[dsh-file-extra] composer not captured:', sessionId)
+    showToast('目标会话输入框尚未就绪，请打开该会话后重试')
+    return
+  }
+  const reference = { source: 'reference', ref: mention, label: basenameOf(path), appearance: 'file', clipboardText: mention }
+  try {
+    const span = actions.captureInsertion()
+    const actx = pluginCtx?.get?.('sessions')?.scope?.(sessionId)
+    // Dispatch with the session context as subject, otherwise scoped listeners cannot receive it.
+    if (actx?.bail?.(actx, 'slash/input-insert-reference', { reference, span }) === true) {
+      console.debug('[dsh-file-extra] reference via scoped insert-reference event')
+      showToast('已添加 ' + mention + ' 到对话')
+      return
+    }
+    if (actions.insertText(mention + ' ', span)) {
+      console.debug('[dsh-file-extra] reference via inputActions.insertText')
+      showToast('已添加 ' + mention + ' 到对话')
+      return
+    }
+  } catch (err) {
+    console.debug('[dsh-file-extra] insert-reference failed:', err)
+  }
+  showToast('输入框暂不可编辑，未添加文件引用，请稍后重试')
+}
+
+let fileMenuRegistered = false
+
+/** 幂等注册；contextMenus 可能晚于 apply 就绪——apply 与首次 contextmenu 各试一次；ctx.effect 保证可逆。 */
+function ensureFileMenu(): void {
+  if (fileMenuRegistered || !pluginCtx) return
+  try {
+    const menus = pluginCtx.get?.('contextMenus')
+    if (!menus || typeof menus.register !== 'function') return
+    fileMenuRegistered = true
+    const contribute = (): (() => void) => menus.register({
+      id: PLUGIN_ID,
+      target: 'file',
+      order: FILE_MENU_ORDER,
+      resolve: (target: FileMenuTarget) => {
+        const sessionId = typeof target.sessionId === 'string' ? target.sessionId : ''
+        const path = typeof target.path === 'string' ? target.path : ''
+        if (sessionId === '' || path === '') return []
+        if (formatFileMentionText(relativizeToCwd(path, sessionCwd(sessionId))) === undefined) return []
+        return [{
+          id: ADD_REF_ACTION_ID,
+          label: ADD_REF_LABEL,
+          separatorBefore: true,
+          run: () => addFileReference(sessionId, path),
+        }]
+      },
+    })
+    pluginCtx.effect(contribute, 'dsh-file-extra: file context menu')
+  } catch (err) {
+    fileMenuRegistered = false
+    console.debug('[dsh-file-extra] file menu unavailable:', err)
+  }
 }
 
 /* ──────────────────────────────────────────────────────────
@@ -1884,7 +1999,7 @@ function init(): void {
   doc.addEventListener('keyup', onKeyUp, true)
   doc.addEventListener('click', onGlobalClick)
   doc.addEventListener('contextmenu', onDocumentContextMenu, true)
-  console.log('[dsh-file-extra] plugin loaded: file actions + selection comments + terminal selection + tab menu')
+  console.log('[dsh-file-extra] plugin loaded: file actions + selection comments + terminal selection + tab menu + file @reference menu')
 }
 
 /* ── Client plugin contract ── */
@@ -1906,6 +2021,7 @@ function apply(ctx: any): void {
   pluginCtx = ctx
   try { ensureComposerSlot() } catch { /* slots service may not be up yet */ }
   try { ensureTabMenuSlot() } catch { /* ditto */ }
+  try { ensureFileMenu() } catch { /* contextMenus service may not be up yet */ }
 
   try {
     init()

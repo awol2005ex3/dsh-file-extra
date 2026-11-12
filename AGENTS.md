@@ -14,9 +14,10 @@
 | — | 文件行删除按钮 | 本插件新增 |
 | — | 侧边栏 tab 右键菜单：关闭全部 / 关闭其他 | 本插件新增（官方席位 `sidebar.right.tab.menu.item`） |
 | — | 终端（xterm.js）选区引入对话框 | 本插件新增（与预览选区共用工具栏与投递链） |
+| — | 文件行右键菜单：添加到对话 @文件 | 本插件新增（`contextMenus` 数据动作 + 会话作用域 `slash/input-insert-reference` 事件） |
 
 - **混合型插件**：宿主半 `src/index.ts` 负责 `fileUploads` 服务与两条写入路由；浏览器半 `src/client.ts` 负责全部 DOM 交互。
-- **浏览器半是纯 DOM 实现**：不 import cordis/dsh 包，不依赖 `ctx` 服务（connection 仅惰性尝试获取，用于评论投递的 legacy 兜底）。**唯一例外**是 tab 菜单条目：惰性 `require('react')`（宿主 shell seed）+ `ctx.get('slots' / 'sidebarRight')` 注册官方席位，任一环节缺席静默退场。
+- **浏览器半以 DOM 交互为主**：不 import cordis/dsh 包；宿主服务经 `ctx.get(...)` 惰性获取。React 接触点仅有 tab 菜单和输入框捕获组件，均惰性 `require('react')`；后者占用 `conversation.input.left` 列表槽位，layout effect 按会话缓存 InputActions，卸载时清理。文件菜单本身走 `contextMenus` 数据动作，插入走 `sessions.scope` 事件。
 - **交付形态**：npm 包 + dsh bundle。`package.json` 的 `dsh.bundle` / `dsh.client` 字段声明，`cordis.patch.yml` 把插件注册进 Cordis profile 配置树。
 - dsh / cordis API 规范以技能文档 `.agents/skills/dsh-plugin-dev/SKILL.md` 为准，**禁止臆造 API**。
 
@@ -25,7 +26,7 @@
 | 文件 | 职责 |
 |------|------|
 | `src/index.ts` | 宿主端：注册 `FileUploads` 服务、上传路由、删除路由及路径校验 |
-| `src/client.ts` | 浏览器端全部逻辑：样式注入、文件树行/头按钮注入、上传/下载/删除、选区工具栏（预览 + 终端）、评论对话框、Composer 投递、右栏 tab 菜单（关闭全部 / 关闭其他） |
+| `src/client.ts` | 浏览器端全部逻辑：样式注入、文件树行/头按钮注入、上传/下载/删除、选区工具栏（预览 + 终端）、评论对话框、Composer 投递、右栏 tab 菜单（关闭全部 / 关闭其他）、文件 @引用菜单（添加到对话） |
 | `scripts/wrap-client.mjs` | 给 `lib/client.js` 套 `__ModuleLoader__` 闭包工厂外壳，并剥掉 tsc 追加的 `export {}` |
 | `cordis.patch.yml` | profile patch：把 `dsh-file-extra` 注册进配置树 |
 | `package.json` | 包声明 + dsh 插件配置；`files` 决定发包内容；`exports["./package.json"]` 必须保留 |
@@ -68,7 +69,7 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
 14. **删除的安全边界**：宿主侧要求 `path` 位于 `root` 内、拒绝目录、用 `lstat` + `unlink`（符号链接只删链接本身）。不要改成 `rm -r`，也不要去掉 `root` 约束。
 15. **评论区选区判定必须逐级走 `parentNode`**（`closestAcrossShadow`）：文本选区的 `anchorNode` 通常是 Text 节点而非 Element；Shadow DOM 内不能从 ShadowRoot 直接跳 host。禁止把它「简化」回单跳逻辑（历史 bug：`inPreviewArea` 恒 false → 选中无效果）。
 16. **Composer 投递链**（`sendToComposer`，每层独立 try/catch、失败自动降级）：
-    ① 官方通道：`ctx.get('slots')`（**不能写 `ctx.slots`**——cordis 4 严格访问未声明 inject 的服务属性会抛错）→ 被动注册 `conversation.input.activity` slot 捕获 `props.inputActions`，`captureInsertion()` + `insertText()`；
+    ① 官方通道：`ctx.get('slots')`（**不能写 `ctx.slots`**——cordis 4 严格访问未声明 inject 的服务属性会抛错）→ 在 `conversation.input.left`（list / session）注册带唯一 id 的空组件，通过 React layout effect 捕获 `props.inputActions`，卸载时清理；`captureInsertion()` + `insertText()`；
     ② DOM 兜底：主输入框 contenteditable 派发合成 `ClipboardEvent('paste')`，`execCommand('insertText')` 再兜底；
     ③ `connection.rpc.call('/api', 'conversation/input-paste', ...)`（历史保留，端点未证实）；
     ④ `window.__dshContext` 兜底；
@@ -88,6 +89,13 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
     - 刷新时机：`mouseup`（拖选）、`dblclick`（双击选词）、`keyup`（Shift+方向键）后各补一次读取；都延到下一帧/宏任务，等 xterm 自己的监听跑完。
     - 终端面板锚点是 `section[data-sidebar-terminal]`（`ui-sidebar-terminal` 的宿主元素）；tab 标题取 `span[data-sidebar-right-tab]` 的文本，closest 找不到时再扫 shadow root（结果缓存）。
     - 终端输出没有文件路径与行列号，投递时以「📟 `<tab 标题>` — 终端输出」作头部；超过 `MAX_TERMINAL_CHARS`（20000 字符）截断并标注。
+22. **文件 @引用菜单（`contextMenus` 数据动作 + 会话作用域事件）契约**：
+    - 文件行右键菜单由宿主 `contextMenus` 服务装配（`ui-context-menu`），**不是 slot**。用 `ctx.get('contextMenus').register({ id: PLUGIN_ID, target: 'file', order: 300, resolve })` 追加数据动作；内置 open-in-app / file-actions 是 order 100/200，300 + `separatorBefore: true` 排在宿主条目之后。`resolve(target)` 返回 `MenuAction[]`（`{ id, label, separatorBefore, run }`），`run` 里执行插入。注册经 `ctx.effect` 包裹保证可逆；`contextMenus` 可能晚于 apply 就绪，apply 与首次 `contextmenu`（capture）各补试一次（`ensureFileMenu` 幂等）。
+    - target value 是 `{ sessionId, path }`，**path 恒为绝对路径**（`ui-sidebar-files` store 契约）。投递前用本地复刻的 `relativizeToCwd`（剥会话 cwd 根前缀、保留原分隔符）+ `formatFileMentionText`（`@deepseek-ai/dsh-file-reference/grammar` 的 file 分支：控制字符 / 引号 → 不可表示，含空格 → `@"…"`）生成 mention；cwd 读 `sessions.list.getSnapshot().byId[sessionId]?.cwd`。不可表示的路径在 `resolve` 里就不返回条目。
+    - **插 chip 的唯一官方路径是会话作用域 bail 事件**：`const actx = sessions.scope(sessionId)`（返回 `AgentContext | undefined`，**不是** handle），再 `actx.bail(actx, 'slash/input-insert-reference', { reference, span }) === true`。thisArg 必须是 scope 出来的 actx——根 ctx 派发会被 `[Context.filter]` 挡在会话 shell 之外。`reference` 形如 `{ source: 'reference', ref: mention, label: basename, appearance: 'file', clipboardText: mention }`（与 `ui-reference` onPick / `ui-conversation` apply.ts addFiles 一致）；`span` 来自该会话 InputActions 的 `captureInsertion()`，shell 侧有 phase（plain/claimed）+ `draftRev` CAS 守卫。
+    - **InputActions 按已挂载会话捕获**：使用 `conversation.input.left`（list / session）+ 唯一 id `dsh-file-extra/composer-capture`，空组件经 React `useLayoutEffect` 保存 `props.sessionId` / `props.inputActions`，卸载或 props 改变时清理旧引用。**不能占用 `conversation.input.activity`**：它是 single，同优先级冲突会抛错，其他优先级只渲染赢家，返回 null 也不会自动让出给其他插件。
+    - 文件引用只走目标会话的 scoped bail 事件，未接受时用同一 span 尝试 `actions.insertText(mention + ' ', span)`（纯 @token）。未捕获或编辑器锁定时提示重试；**禁止退回 DOM 粘贴或系统剪贴板**，禁止自动 submit，不能把复制成功当成插入成功。预览/终端评论的原有降级链不变。
+    - `contextMenus` / `sessions` 都用 `ctx.get(...)` 惰性取，**不得**写进顶层 `inject`。`contextMenus` 缺席不注册菜单；`sessions` 缺席时仍可经已捕获的 InputActions 直接插入文本，其余功能不受影响。
 
 ## 5. 调试入口（DevTools Console）
 
@@ -103,6 +111,10 @@ npm run build        # tsc → lib/ + wrap-client.mjs 包装浏览器 bundle
 | `tab menu slot unavailable: ...` / `tab menu registration failed: ...` | slots 服务缺席或注册失败 → tab 菜单无追加条目（其余功能不受影响） |
 | `react unavailable: ...` | 宿主 seed 取不到 react → tab 菜单功能整体退场 |
 | `close tab failed: <id> ...` | 单个 tab 关闭异常（其余继续关） |
+| `file menu unavailable: ...` | 文件菜单注册异常（contextMenus 缺席时静默跳过） |
+| `composer capture unavailable: ...` / `composer not captured: <sessionId>` | 输入框槽位注册失败 / 目标会话输入框尚未挂载 |
+| `reference via ...` | @引用直接插入命中的通道（scoped insert-reference / insertText） |
+| `insert-reference failed: ...` | 插入异常，显示重试提示，不写剪贴板 |
 | `window.__dshFileExtraMounted` | 单例守卫，true 表示已挂载（刷新复位） |
 | `window.__dshFileExtraError` | init 抛出的异常字符串 |
 | `window.__dshFileExtraConnection` | 惰性缓存的 connection 服务 |
